@@ -19,8 +19,8 @@ def generate_launch_description():
                 {'k_a': 0.1},  # Adaptation gain for pendulum controller
                 {'m_virtual': 1.0},  # Virtual mass for heading controller
                 {'path_file': os.path.join(os.path.dirname(__file__), '..', 'path_example.yaml')},  # Path to YAML file with waypoints
-                {'ref_lat': 63.4305},  # Set to your reference origin
-                {'ref_lon': 10.3951},
+                {'ref_lat': -22.986633223025905},  # Rio de Janeiro area
+                {'ref_lon': -43.2025620936613},
                 {'ref_alt': 0.0}
             ]
         )
