@@ -31,7 +31,7 @@ class ControllerNode(Node):
         
 
         # Parameters for the controller
-        self.m_virtual = 20.0  # Virtual mass of the ASV (kg) (Keeping close to actual mass)
+        self.m_virtual = 225.0  # Virtual mass of the ASV (kg) (Keeping close to actual mass)
         self.k_v = 1.0  # Velocity control gain
         self.k_a = 0.5  # Acceleration control gain
         self.L = 3.5  # Length of the tether (m)
@@ -279,8 +279,9 @@ class ControllerNode(Node):
         # Headway computation
         Gamma = np.array([np.cos(theta), np.sin(theta)])
         dGamma = np.array([-np.sin(theta), np.cos(theta)])
-        p = p0 + self.epsilon * Gamma  # Position of the pendulum mass
-        v = v0 + self.epsilon * theta_dot * dGamma  # Velocity of the pendulum mass
+        # Convert p0 to a 2D numpy array
+        p = np.array([p0.x, p0.y]) + self.epsilon * Gamma  # Position of the pendulum mass
+        v = np.array(v0[:2]) + self.epsilon * theta_dot * dGamma  # Velocity of the pendulum mass
 
         # Compute Reference Velocity (requires LOS)
         v_ref, s_dot = self.line_of_sight(p, s, self.path_fcn, self.params)
@@ -291,7 +292,7 @@ class ControllerNode(Node):
 
         # Adaption law
         u_p, zeta_dot = self.pendulum_adaptive_controller(
-            np.concatenate(([theta, theta_dot], p0, v0)),
+            np.concatenate(([theta, theta_dot], [p0.x, p0.y], v0[:2])),
             zeta,
             v_ref,
             v_ref_dot,
@@ -324,8 +325,9 @@ class ControllerNode(Node):
         psi_error = ((psi - psi_ref + np.pi) % (2 * np.pi)) - np.pi  # Wrap to [-pi, pi]
         u_r = -self.k_psi * psi_error - self.k_r * (r - r_ref)
 
-        # Control Forces (Requires virtual mass controller)
-        u = np.array([u_p, u_r])
+        # Create control input vector - Fix the inhomogeneous shape issue
+        u = np.array([*u_p, u_r])  # Unpack u_p components and append u_r
+        # Alternative: u = np.concatenate([u_p, [u_r]])
             
         tau = self.asv_virtual_mass_controller(q, q_dot, psi, self.mdl, u, self.m_virtual)
         T_L, T_R = self.asv_thrust_allocation(tau, self.mdl)
@@ -360,7 +362,7 @@ class ControllerNode(Node):
         theta_path = math.atan2(p_path_dot[1], p_path_dot[0])
         R_path = np.array([[np.cos(theta_path), -np.sin(theta_path)], 
                            [np.sin(theta_path), np.cos(theta_path)]])
-        delta_norm = np.norm(p_path_dot)
+        delta_norm = np.linalg.norm(p_path_dot)
 
         # Path-following error:
         e = R_path.T @ (p - p_path)
@@ -381,35 +383,44 @@ class ControllerNode(Node):
         # Unpack states
         theta = x[0]
         theta_dot = x[1]
-        #p0 = x[2:3]
-        v0 = x[4:5]
+        v0 = x[4:6]
 
-        Gamma = [np.cos(theta), np.sin(theta)]
-        dGamma = [-np.sin(theta), np.cos(theta)]
+        Gamma = np.array([np.cos(theta), np.sin(theta)])
+        dGamma = np.array([-np.sin(theta), np.cos(theta)])
 
-        # Virtual output
-        # p = p0 + epsilon * L * Gamma
-        v = v0 + epsilon * L * theta_dot * dGamma
+        # Ensure v0 and v1 are 2D vectors
+        v0 = np.array(v0).reshape(2)
+        v = np.array(v0) + epsilon * L * theta_dot * dGamma
         v_err = v - v_ref
 
-        v1 = v0 + L * theta_dot * dGamma # Velocity of the second mass
-        J = np.outer(dGamma, dGamma) # Jacobian matrix
-        
-        # Regressor
-        Y = np.concatenate([
-            [L * theta_dot**2 * Gamma - theta_dot/ (2 * (epsilon - 1)) * (np.outer(Gamma, dGamma) + np.outer(dGamma, Gamma)) * v_err - J * (v_ref_dot - k_v * v_err) / (epsilon - 1)],
-            v0,
-            L * theta_dot * dGamma,
-            np.eye(2),
-            J * v1,
-            J,
-            k_v * v_err - v_ref_dot]
-        )
+        v1 = np.array(v0) + L * theta_dot * dGamma
+        J = np.outer(dGamma, dGamma)
+
+        # Compute terms ensuring consistent dimensions
+        term1 = L * theta_dot**2 * Gamma
+        term2 = -theta_dot / (2 * (epsilon - 1)) * ((np.outer(Gamma, dGamma) + np.outer(dGamma, Gamma)) @ v_err)
+        term3 = -J @ (v_ref_dot - k_v * v_err) / (epsilon - 1)
+
+        # Stack columns ensuring all have shape (2, n) where n matches zeta dimension (7)
+        Y = np.column_stack([
+            (term1 + term2 + term3).reshape(2, 1),  # shape: (2,1)
+            v0.reshape(2, 1),                       # shape: (2,1)
+            (L * theta_dot * dGamma).reshape(2, 1), # shape: (2,1)
+            (k_v * v_err - v_ref_dot).reshape(2, 1),# shape: (2,1)
+            J @ v1.reshape(2, 1),                   # shape: (2,1)
+            J,                                      # shape: (2,2)
+        ])
+
+        # Verify dimensions
+        if Y.shape[1] != len(zeta):
+            self.get_logger().error(f"Dimension mismatch: Y shape {Y.shape}, zeta length {len(zeta)}")
+            raise ValueError(f"Y columns ({Y.shape[1]}) must match zeta length ({len(zeta)})")
 
         # Control force
-        u = -Y * zeta
+        u = -Y @ zeta
+
         # Adaption law
-        zeta_dot = -k_a * Y.T * v_err
+        zeta_dot = k_a * (Y.T @ v_err)
 
         return u, zeta_dot
 
@@ -430,11 +441,12 @@ class ControllerNode(Node):
 
     def asv_virtual_mass_controller(self, q, q_dot, psi, mdl, u, m_virtual):
         """Virtual mass controller (+ Thrust Allocation) for underactuated ASVs."""
-        # Unpack states
-        u_p, u_r = u
+        # Unpack states - modified to handle 3-element input
+        u_px, u_py = u[0:2]  # First two elements are planar force
+        u_r = u[2]           # Last element is rotational
 
         # Step1: Converting desired planer force to surge direction
-        F_u, psi_d, phi = self.underactuated_transform(u_p, psi)
+        F_u, psi_d, phi = self.underactuated_transform(np.array([u_px, u_py]), psi)
 
         # Step2: Desired body-frame force vector
         tau_d = np.array([F_u, 0.0, u_r])
@@ -492,10 +504,17 @@ class ControllerNode(Node):
             F_u = -norm_u
         return F_u, psi_d, phi
     
-    def mass_Coriolis(mdl, q, q_dot):
+    def mass_Coriolis(self, mdl, q, q_dot):
         """
         Compute the mass matrix M and damping vector b for the ASV model.
-        Equivalent to the EulerLagrangeX._mass_Coriolis! call in Julia. (source: gpt)
+        
+        Args:
+            mdl (dict): Dictionary containing ASV model parameters
+            q (np.ndarray): State vector [x, y, psi]
+            q_dot (np.ndarray): Velocity vector [u, v, r]
+            
+        Returns:
+            tuple: (M, b) where M is mass matrix and b is damping vector
         """
         psi = q[2]
         u, v, r = q_dot  # body-frame velocities
@@ -505,14 +524,14 @@ class ControllerNode(Node):
         Xu, Yv, Nr, Yr = mdl["Xu"], mdl["Yv"], mdl["Nr"], mdl["Yr"]
         Dul, Dvl, Drl = mdl["Dul"], mdl["Dvl"], mdl["Drl"]
 
-        # --- Mass matrix (simplified rigid-body + added mass approximation)
+        # Mass matrix (simplified rigid-body + added mass approximation)
         M = np.array([
             [m + Xu, 0, 0],
             [0, m + Yv, m * mdl["xG"]],
             [0, m * mdl["xG"], J + Nr]
         ])
 
-        # --- Coriolis + damping term (simplified)
+        # Coriolis + damping term (simplified)
         C = np.array([
             [0, -m * r, 0],
             [m * r, 0, 0],
@@ -520,13 +539,13 @@ class ControllerNode(Node):
         ])
 
         D = np.diag([Dul, Dvl, Drl])
-
         b = (C + D) @ q_dot
 
         return M, b
     
 
     ####################### Model ################################
+    @staticmethod
     def asv_model(dimensions, xG, time_constants, V_current):
         """Create a simple dynamic model of the ASV based on its dimensions and time constants."""
         # ASV dynamic model parameters
