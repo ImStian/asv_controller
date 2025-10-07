@@ -15,6 +15,7 @@ from autograd import jacobian # for los
 class ControllerNode(Node):
     def __init__(self):
         super().__init__('controller_node')
+<<<<<<< HEAD
 
         # Parameters for LOS
         self.params = {
@@ -22,23 +23,58 @@ class ControllerNode(Node):
             "U": 5.0,      # Desired speed [m/s]
             "k": 0.3       # Parameter update gain
         }  
-        self.path_fcn = lambda s: np.array([s, 0.0])  # path function: straight line along x-axis
+
         
         # Initialize the state vector x_i
         self.s = 0.0  # Initial path parameter
-        self.zeta = np.zeros(7)  # Adjust size based on your parameter vector
+        self.path = None
+        self.enu_path = None
+        # Declare path_file parameter (empty -> no file)
+=======
+        # Declare parameters for all controller/system gains
+        self.declare_parameter('U', 1.0)
+        self.declare_parameter('Delta', 5.0)
+        self.declare_parameter('k', 0.5)
+        self.declare_parameter('L', 3.5)
+        self.declare_parameter('epsilon', 0.5)
+        self.declare_parameter('k_v', 1.0)
+        self.declare_parameter('k_a', 0.1)
+        self.declare_parameter('m_virtual', 1.0)
+>>>>>>> parent of 671b9d6 (Implemented Entire Control Code (not tested))
+        self.declare_parameter('path_file', '')
+        # Reference origin for LLA->ENU conversions (defaults can be overridden via params)
+        self.declare_parameter('ref_lat', 0.0)
+        self.declare_parameter('ref_lon', 0.0)
+        self.declare_parameter('ref_alt', 0.0)
+        # Read reference origin values into attributes
+        try:
+            self.ref_lat = float(self.get_parameter('ref_lat').get_parameter_value().double_value)
+            self.ref_lon = float(self.get_parameter('ref_lon').get_parameter_value().double_value)
+            self.ref_alt = float(self.get_parameter('ref_alt').get_parameter_value().double_value)
+        except Exception:
+            # Fallback defaults if parameter read fails
+            self.ref_lat = 0.0
+            self.ref_lon = 0.0
+            self.ref_alt = 0.0
+
+        # Attempt to load a path file if provided
+        self.load_path()
+
+        # Parameter estimate vector (matches pendulum regressor columns -> 9 elements)
+        self.zeta = np.zeros(9)
         self._prev_control_time = None
         
 
         # Parameters for the controller
-        self.m_virtual = 20.0  # Virtual mass of the ASV (kg) (Keeping close to actual mass)
+        self.m_virtual = 228.78  # Virtual mass of the ASV (kg) (Keeping close to actual mass)
         self.k_v = 1.0  # Velocity control gain
-        self.k_a = 0.5  # Acceleration control gain
+        self.k_a = 0.05  # Acceleration (adaptation) gain - reduced to improve stability
         self.L = 3.5  # Length of the tether (m)
         self.epsilon = 0.5  # Small positive constant for adaptive controller
         self.k_psi = 1.0  # Heading control gain
         self.k_r = 1.0  # Yaw rate control gain
         self.declare_parameter('heading_mode', 'LOS') # 'LOS' or 'Path'
+        self.dt = 1e-6  # Time step for numerical derivatives
 
         # System Model (See seperate section in this file for functions)
         dimensions = (1.20, 0.93, 0.20) # Dimensions of the ASV [length, width, draft] in meters
@@ -74,6 +110,80 @@ class ControllerNode(Node):
             '/model/blueboat/joint/motor_stbd_joint/cmd_thrust',
             10)
         self.get_logger().info('Controller node started.')
+
+    ######################## Path FUNCTIONS ################################
+    def load_path(self):
+        """
+        Loads waypoints from a YAML file. The file should look like:
+        waypoints:
+          - [lat1, lon1]
+          - [lat2, lon2]
+        Waypoints are latitude/longitude in degrees. They are converted to local ENU coordinates (meters)
+        using the reference origin (ref_lat, ref_lon, ref_alt).
+        """
+        # Safely obtain the path_file parameter (it should be declared in __init__)
+        try:
+            path_file = self.get_parameter('path_file').get_parameter_value().string_value
+        except Exception:
+            path_file = ''
+
+        if path_file:
+            try:
+                with open(path_file, 'r') as f:
+                    data = yaml.safe_load(f)
+                    self.path = data.get('waypoints', None)  # expects list of [lat, lon]
+                if self.path:
+                    # Convert to ENU using reference origin (declared above)
+                    try:
+                        self.enu_path = [self.lla_to_enu(lat, lon, self.ref_lat, self.ref_lon, self.ref_alt) for lat, lon in self.path]
+                        self.get_logger().info(f'Loaded path from {path_file} (lat/lon, converted to ENU)')
+                    except Exception as e:
+                        self.get_logger().error(f'Failed to convert waypoints to ENU: {e}')
+                        self.path = None
+                        self.enu_path = None
+                else:
+                    self.get_logger().warn(f'No waypoints found in {path_file}')
+                    self.path = None
+                    self.enu_path = None
+            except Exception as e:
+                self.get_logger().error(f'Failed to load path: {e}')
+                self.path = None
+                self.enu_path = None
+        else:
+            # No external path provided: leave path as None. The code uses a default analytic path in that case.
+            self.path = None
+            self.enu_path = None
+
+    def path_fcn(self, s):
+        """
+        Returns the interpolated [x, y] ENU position along the path for parameter s.
+        If no path is loaded, defaults to a straight line along x.
+        """
+        path = self.enu_path if self.enu_path and len(self.enu_path) >= 2 else None
+        if not path:
+            return [s, 0.0]
+        idx = int(s)
+        if idx >= len(path) - 1:
+            return path[-1]
+        p0 = path[idx]
+        p1 = path[idx+1]
+        t = s - idx
+        return [p0[0] + t*(p1[0]-p0[0]), p0[1] + t*(p1[1]-p0[1])]
+
+    def path_fcn_dot(self, s):
+        """
+        Returns the derivative [dx, dy] of the ENU path at parameter s.
+        Used for LOS guidance direction.
+        """
+        path = self.enu_path if self.enu_path and len(self.enu_path) >= 2 else None
+        if not path:
+            return [1.0, 0.0]
+        idx = int(s)
+        if idx >= len(path) - 1:
+            idx = len(path) - 2
+        p0 = path[idx]
+        p1 = path[idx+1]
+        return [p1[0]-p0[0], p1[1]-p0[1]]
 
     #########################   COORDINATE CONVERSION  ################################
     def lla_to_enu(self, lat, lon, ref_lat, ref_lon, ref_alt):
@@ -234,12 +344,12 @@ class ControllerNode(Node):
         if theta_dot is None:
             now = self.get_clock().now().nanoseconds * 1e-9
             if hasattr(self, '_prev_angle') and hasattr(self, '_prev_time'):
-                dt = now - self._prev_time
-                if dt > 1e-6:
-                    dtheta = angle - self._prev_angle
+                self.dt = now - self._prev_time
+                if self.dt > 1e-6:
+                    theta = angle - self._prev_angle
                     # unwrap to [-pi, pi]
-                    dtheta = (dtheta + math.pi) % (2*math.pi) - math.pi
-                    theta_dot = dtheta / dt
+                    theta = (theta + math.pi) % (2*math.pi) - math.pi
+                    theta_dot = theta / self.dt
                 else:
                     theta_dot = 0.0
             else:
@@ -255,20 +365,21 @@ class ControllerNode(Node):
         "Compute the control forces and state derivaties for the ASV towing controller"
 
         # Unpack the state
-        p0 = self.blueboat_odom.pose.pose.position # position in ENU
+        p0_msg = self.blueboat_odom.pose.pose.position
+        p0 = np.array([p0_msg.x, p0_msg.y])  # 2D position
         psi = self.blueboat_heading # heading
-        v0 = self.blueboat_vel # Velocity of the ASV in the body frame
+        v0 = np.array(self.blueboat_vel[:2])  # 2D velocity [vx, vy]
         r = self.blueboat_angular_vel[2] # Yaw rate (rad/s)
-        q = np.array([p0.x, p0.y, psi]) # Full ASV state [x, y, psi]
+        q = np.array([p0[0], p0[1], psi]) # Full ASV state [x, y, psi]
         q_dot = np.array([v0[0], v0[1], r]) # ASV velocity state [u, v, r]
         _ , theta, theta_dot = self.calculate_relative_position() # Angle and Angular velocity of the pendulum
 
         # Get current time in seconds
         now = self.get_clock().now().nanoseconds * 1e-9
         if self._prev_control_time is not None:
-            dt = now - self._prev_control_time
+            self.dt = now - self._prev_control_time
         else:
-            dt = 0.0
+            self.dt = 0.0
         self._prev_control_time = now
 
         # Use class member states
@@ -285,13 +396,19 @@ class ControllerNode(Node):
         # Compute Reference Velocity (requires LOS)
         v_ref, s_dot = self.line_of_sight(p, s, self.path_fcn, self.params)
 
-        # Approximate acceleration of the pendulum mass
-        v_ref_plus, _ = self.line_of_sight(p + dt * v, self.s + dt * s_dot, self.path_fcn, self.params)
-        v_ref_dot = (v_ref_plus - v_ref) / dt
+        # Approximate acceleration of the pendulum mass (guard against self.dt == 0)
+        v_ref_plus, _ = self.line_of_sight(p + self.dt * v, self.s + self.dt * s_dot, self.path_fcn, self.params)
+        if self.dt is None or self.dt <= 1e-8:
+            v_ref_dot = np.zeros_like(v_ref)
+        else:
+            v_ref_dot = (v_ref_plus - v_ref) / self.dt
 
         # Adaption law
+        # Build state vector x = [theta, theta_dot, p0_x, p0_y, v0_x, v0_y]
+        x_state = np.concatenate(([theta, theta_dot], p0, v0))
+
         u_p, zeta_dot = self.pendulum_adaptive_controller(
-            np.concatenate(([theta, theta_dot], p0, v0)),
+            x_state,
             zeta,
             v_ref,
             v_ref_dot,
@@ -314,7 +431,7 @@ class ControllerNode(Node):
             psi_ref = np.arctan2(v_ref[1], v_ref[0])
             # Approximate the derivative
             psi_ref_plus = np.arctan2(v_ref_dot[1], v_ref_dot[0])
-            r_ref = (psi_ref_plus - psi_ref) / dt
+            r_ref = (psi_ref_plus - psi_ref) / self.dt
 
         else:
             self.get_logger().error("Invalid heading_mode parameter. Use 'LOS' or 'Path'.")
@@ -325,16 +442,68 @@ class ControllerNode(Node):
         u_r = -self.k_psi * psi_error - self.k_r * (r - r_ref)
 
         # Control Forces (Requires virtual mass controller)
-        u = np.array([u_p, u_r])
-            
+        u = (u_p, u_r)
+
+        # Safety: if adaptive controller produced an excessively large planar force, fall back
+        # to a proportional velocity controller to maintain stability and near-constant speed.
+        try:
+            u_p_norm = float(np.linalg.norm(u_p))
+        except Exception:
+            u_p_norm = float('nan')
+        if math.isfinite(u_p_norm) and u_p_norm > 1e4:
+            # fallback proportional controller (force ~ m_virtual * Kp * velocity_error)
+            Kp_fb = 10.0
+            vel_err = v_ref - (v0 + self.epsilon * self.L * theta_dot * np.array([-math.sin(theta), math.cos(theta)]))
+            u_p_fb = self.m_virtual * Kp_fb * vel_err
+            self.get_logger().warning(f'Adaptive u_p too large ({u_p_norm:.3g}), using P-fallback u_p={u_p_fb}')
+            u_p = u_p_fb
+
+        # Diagnostics: check magnitudes before passing to virtual mass controller
+        try:
+            u_p_norm = float(np.linalg.norm(u_p))
+        except Exception:
+            u_p_norm = float('nan')
+        zeta_norm = float(np.linalg.norm(self.zeta)) if hasattr(self, 'zeta') else float('nan')
+        if not math.isfinite(u_p_norm) or u_p_norm > 1e3 or zeta_norm > 1e3:
+            self.get_logger().warning(f'High control magnitude detected: |u_p|={u_p_norm:.3g}, u_r={u_r:.3g}, |zeta|={zeta_norm:.3g}')
+
         tau = self.asv_virtual_mass_controller(q, q_dot, psi, self.mdl, u, self.m_virtual)
         T_L, T_R = self.asv_thrust_allocation(tau, self.mdl)
 
 
         # Update states with time integration
-        if dt > 0:
-            self.s += s_dot * dt  # Update path parameter
-            self.zeta += zeta_dot * dt  # Update parameter estimates
+        if self.dt > 0:
+            self.s += s_dot * self.dt  # Update path parameter
+            # Keep s in [0,1) since path_function maps s->angle=2*pi*s for the circle
+            self.s = self.s % 1.0
+            # Clamp adaptation rate to avoid instability
+            MAX_ZETA_DOT = 100.0
+            try:
+                zeta_dot_norm = float(np.linalg.norm(zeta_dot))
+            except Exception:
+                zeta_dot_norm = float('nan')
+            if not math.isfinite(zeta_dot_norm):
+                self.get_logger().warning(f'non-finite zeta_dot detected: {zeta_dot}')
+                zeta_dot = np.zeros_like(self.zeta)
+            elif zeta_dot_norm > MAX_ZETA_DOT:
+                zeta_dot = zeta_dot * (MAX_ZETA_DOT / zeta_dot_norm)
+                self.get_logger().warning(f'zeta_dot clipped to norm {MAX_ZETA_DOT}')
+
+            self.zeta += zeta_dot * self.dt  # Update parameter estimates
+
+            # Clamp zeta magnitude to avoid runaway parameters
+            MAX_ZETA = 20
+            try:
+                zeta_norm = float(np.linalg.norm(self.zeta))
+            except Exception:
+                zeta_norm = float('nan')
+            if not math.isfinite(zeta_norm) or zeta_norm > MAX_ZETA:
+                # scale back to MAX_ZETA
+                if math.isfinite(zeta_norm) and zeta_norm > 0:
+                    self.zeta = self.zeta * (MAX_ZETA / zeta_norm)
+                else:
+                    self.zeta = np.zeros_like(self.zeta)
+                self.get_logger().warning(f'zeta clipped to norm {MAX_ZETA}')
 
         # Publish thrust commands
         try:
@@ -346,8 +515,6 @@ class ControllerNode(Node):
         
         return tau
 
-
-
     def line_of_sight(self, p, s, path_fcn, params):
         # Unpack parameters
         U = params["U"]
@@ -356,17 +523,22 @@ class ControllerNode(Node):
 
         # Compute the path point and its derivative
         p_path = path_fcn(s)
-        p_path_dot = jacobian(path_fcn)(s)
+        if hasattr(self, 'path_fcn_dot') and callable(self.path_fcn_dot):
+            p_path_dot = self.path_fcn_dot(s)
+        else:
+            p_path_dot = jacobian(path_fcn)(s)
         theta_path = math.atan2(p_path_dot[1], p_path_dot[0])
         R_path = np.array([[np.cos(theta_path), -np.sin(theta_path)], 
                            [np.sin(theta_path), np.cos(theta_path)]])
-        delta_norm = np.norm(p_path_dot)
+        delta_norm = np.linalg.norm(p_path_dot)
+        delta_norm = np.maximum(delta_norm, 1e-6)  # Prevent division by zero
 
         # Path-following error:
         e = R_path.T @ (p - p_path)
         e_x = e[0]
         e_y = e[1]
         D = np.sqrt(delta**2 + e_y**2)
+        D = np.maximum(D, 1e-6)  # Prevent division by zero
 
         # LOS guidance law
         v_LOS = U / D * R_path @ np.array([delta, -e_y])
@@ -378,55 +550,86 @@ class ControllerNode(Node):
 
     def pendulum_adaptive_controller(self, x, zeta, v_ref, v_ref_dot, L, epsilon, k_v, k_a):
         """Adaptive controller for the pendulum dynamics."""
-        # Unpack states
-        theta = x[0]
-        theta_dot = x[1]
-        #p0 = x[2:3]
-        v0 = x[4:5]
+        # Validate and unpack states
+        x = np.asarray(x).flatten()
+        if x.size < 6:
+            raise ValueError(f"pendulum_adaptive_controller: expected x with length>=6, got shape {x.shape}, x={x}")
 
-        Gamma = [np.cos(theta), np.sin(theta)]
-        dGamma = [-np.sin(theta), np.cos(theta)]
+        theta = float(x[0])
+        theta_dot = float(x[1])
+        p0 = np.asarray(x[2:4], dtype=float).reshape(2,)
+        v0 = np.asarray(x[4:6], dtype=float)
+        # Defensive fallback: if caller passed malformed v0 (empty or wrong shape), try to use node's stored velocity
+        if v0.size != 2:
+            try:
+                v0 = np.asarray(self.blueboat_vel[:2], dtype=float).reshape(2,)
+                self.get_logger().warning(f'pendulum_adaptive_controller: malformed v0 in x, using self.blueboat_vel -> {v0}')
+            except Exception:
+                v0 = np.zeros(2, dtype=float)
+                self.get_logger().warning('pendulum_adaptive_controller: malformed v0 in x and no self.blueboat_vel, using zeros')
+        else:
+            v0 = v0.reshape(2,)  # Take the velocity components [vx, vy]
 
-        # Virtual output
-        # p = p0 + epsilon * L * Gamma
+        Gamma = np.array([np.cos(theta), np.sin(theta)])
+        dGamma = np.array([-np.sin(theta), np.cos(theta)])
+
+        # Virtual output (match original formulation: v = v0 + ε L θ̇ dΓ)
         v = v0 + epsilon * L * theta_dot * dGamma
         v_err = v - v_ref
 
-        v1 = v0 + L * theta_dot * dGamma # Velocity of the second mass
-        J = np.outer(dGamma, dGamma) # Jacobian matrix
-        
-        # Regressor
-        Y = np.concatenate([
-            [L * theta_dot**2 * Gamma - theta_dot/ (2 * (epsilon - 1)) * (np.outer(Gamma, dGamma) + np.outer(dGamma, Gamma)) * v_err - J * (v_ref_dot - k_v * v_err) / (epsilon - 1)],
-            v0,
-            L * theta_dot * dGamma,
-            np.eye(2),
-            J * v1,
-            J,
-            k_v * v_err - v_ref_dot]
-        )
+        v1 = v0 + L * theta_dot * dGamma  # Velocity of the second mass
+        J = np.outer(dGamma, dGamma)  # Jacobian matrix
 
-        # Control force
-        u = -Y * zeta
-        # Adaption law
-        zeta_dot = -k_a * Y.T * v_err
+        # Regressor: build a 2 x 9 matrix following the Julia implementation
+        # Columns are: [col1, v0, L*theta_dot*dGamma, I(2) (2 cols), J@v1, J (2 cols), final]
+        col1 = (L * theta_dot**2 * Gamma
+                - theta_dot / (2 * (epsilon - 1)) * ((np.outer(Gamma, dGamma) + np.outer(dGamma, Gamma)) @ v_err)
+                - (J @ (v_ref_dot - k_v * v_err)) / (epsilon - 1))
+
+        # Ensure column shapes are (2,) or (2,1); np.column_stack handles mixing 2x1 and 2x2 blocks
+        Y = np.column_stack([
+            col1,                      # (2,)
+            v0,                        # (2,)
+            L * theta_dot * dGamma,    # (2,)
+            np.eye(2),                 # (2,2) contributes two columns
+            (J @ v1),                  # (2,)
+            J,                         # (2,2) contributes two columns
+            (k_v * v_err - v_ref_dot)  # (2,)
+        ])
+
+        # Control force (2-vector)
+        u = - Y @ zeta
+
+        # Adaptation law (9-vector)
+        zeta_dot = self.update_adaptation(Y, v_err, self.dt)
 
         return u, zeta_dot
-
     
     def pendulum_parameter_vector(self, m0, m, c0, c, epsilon, V_c=None):
         """Constructs the parameter vector for the adaptive controller of a pendulum system."""
-        zeta = np.array([
-            m * (1 - epsilon) - m0 * epsilon,
-            -(c + c0),
-            -c,
-            (c + c0) * V_c,
-            c * (1 + m0 + epsilon / (m * (epsilon -1))),
-            -c * (1 + m0 + epsilon / (m * (epsilon -1))) * V_c,
-            m + m0
-        ]).T
+        if V_c is None:
+            V_c = np.zeros(2)
+
+        # Build the parameter vector matching the Julia structure. Some entries are 2-element
+        # vectors (those multiplied by V_c), so concatenate and flatten to a 9-element vector.
+        zeta_parts = [
+            np.array(m * (1 - epsilon) - m0 * epsilon),  # scalar
+            np.array(-(c + c0)),                         # scalar
+            np.array(-c),                                # scalar
+            (c + c0) * np.asarray(V_c),                  # vector (2,)
+            np.array(c * (1 + m0 * epsilon / (m * (epsilon - 1)))),  # scalar
+            -c * (1 + m0 * epsilon / (m * (epsilon - 1))) * np.asarray(V_c),  # vector (2,)
+            np.array(m + m0)                             # scalar
+        ]
+
+        # Flatten into a single 1-D parameter vector of length 9
+        zeta = np.concatenate([np.atleast_1d(p).reshape(-1) for p in zeta_parts])
 
         return zeta
+
+    def heading_control(self, desired_heading, current_heading):
+        """Deprecated: Heading control is implemented directly in control_law"""
+        pass
 
     def asv_virtual_mass_controller(self, q, q_dot, psi, mdl, u, m_virtual):
         """Virtual mass controller (+ Thrust Allocation) for underactuated ASVs."""
@@ -442,8 +645,40 @@ class ControllerNode(Node):
         # Step3: Compute mass and damping terms
         M, b = self.mass_Coriolis(mdl, q, q_dot)
 
+        # Diagnostics: inspect intermediate magnitudes
+        try:
+            tau_d_norm = float(np.linalg.norm(tau_d))
+        except Exception:
+            tau_d_norm = float('nan')
+        try:
+            M_norm = float(np.linalg.norm(M))
+        except Exception:
+            M_norm = float('nan')
+        try:
+            b_norm = float(np.linalg.norm(b))
+        except Exception:
+            b_norm = float('nan')
+
+        if not math.isfinite(tau_d_norm) or tau_d_norm > 1e4:
+            self.get_logger().warning(f'Large tau_d detected: |tau_d|={tau_d_norm:.3g}, clamping')
+        if not math.isfinite(M_norm) or M_norm > 1e6:
+            self.get_logger().warning(f'Large mass matrix norm: |M|={M_norm:.3g}')
+        if not math.isfinite(b_norm) or b_norm > 1e6:
+            self.get_logger().warning(f'Large damping vector norm: |b|={b_norm:.3g}')
+
+        # Safety clamp tau_d to prevent extreme torques/forces
+        MAX_TAU_D = 1e5
+        tau_d_clamped = np.clip(tau_d, -MAX_TAU_D, MAX_TAU_D)
+
         # Step4: Virtual mass dynamic compentation
-        tau = (M @ tau_d) / m_virtual - b
+        # Protect against tiny or non-finite m_virtual
+        if not math.isfinite(m_virtual) or abs(m_virtual) < 1e-6:
+            self.get_logger().warning(f'invalid m_virtual={m_virtual}, using fallback 1.0')
+            m_virtual_safe = 1.0
+        else:
+            m_virtual_safe = m_virtual
+
+        tau = (M @ tau_d_clamped) / m_virtual_safe + b
         tau[1] = 0.0  # No sway force
 
         return tau
@@ -463,6 +698,15 @@ class ControllerNode(Node):
         # Solve for thruster forces (least-squares in case overdetermined)
         T = np.linalg.pinv(B) @ tau
         T_L, T_R = float(T[0]), float(T[1])
+
+        # Safety clamp thruster commands to a reasonable range to avoid simulation blow-ups
+        MAX_THRUST = 100  # units depend on simulator; set conservatively
+        if not math.isfinite(T_L) or abs(T_L) > MAX_THRUST:
+            self.get_logger().warning(f'Thruster left command clamped: {T_L} -> {max(min(T_L, MAX_THRUST), -MAX_THRUST)}')
+            T_L = max(min(T_L, MAX_THRUST), -MAX_THRUST)
+        if not math.isfinite(T_R) or abs(T_R) > MAX_THRUST:
+            self.get_logger().warning(f'Thruster right command clamped: {T_R} -> {max(min(T_R, MAX_THRUST), -MAX_THRUST)}')
+            T_R = max(min(T_R, MAX_THRUST), -MAX_THRUST)
 
         return T_L, T_R
     
@@ -492,7 +736,7 @@ class ControllerNode(Node):
             F_u = -norm_u
         return F_u, psi_d, phi
     
-    def mass_Coriolis(mdl, q, q_dot):
+    def mass_Coriolis(self, mdl, q, q_dot):
         """
         Compute the mass matrix M and damping vector b for the ASV model.
         Equivalent to the EulerLagrangeX._mass_Coriolis! call in Julia. (source: gpt)
@@ -524,9 +768,40 @@ class ControllerNode(Node):
         b = (C + D) @ q_dot
 
         return M, b
+
+    def update_adaptation(self, Y, v_err, dt):
+        """
+        σ-modified, normalized adaptation law with projection.
+        Keeps parameter drift bounded even under noise or bias.
+        """
+        # Gains
+        k_a = self.k_a              # base adaptation rate (e.g. 1e-3)
+        sigma = 0.1                 # leakage gain (try 0.01–0.2)
+        zeta_max = 20.0             # absolute bound on each parameter
+
+        # Normalization to avoid step-size blowup
+        norm_factor = 1.0 + np.linalg.norm(Y)**2
+
+        # σ-modified adaptation law (with normalization)
+        zeta_dot = -k_a * (Y.T @ v_err) / norm_factor - sigma * self.zeta
+
+        # Integrate
+        self.zeta += self.dt * zeta_dot
+
+        # Projection (hard bounding)
+        self.zeta = np.clip(self.zeta, -zeta_max, zeta_max)
+
+        # Optional diagnostics
+        if np.any(np.isnan(self.zeta)):
+            self.get_logger().warning("NaN detected in zeta — resetting to zero.")
+            self.zeta[:] = 0.0
+
+        return zeta_dot
+
     
 
     ####################### Model ################################
+    @staticmethod
     def asv_model(dimensions, xG, time_constants, V_current):
         """Create a simple dynamic model of the ASV based on its dimensions and time constants."""
         # ASV dynamic model parameters

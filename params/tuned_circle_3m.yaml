@@ -6,7 +6,7 @@ controller_node:
     k: 0.5
 
     # Pendulum/adaptive controller (keep defaults unless you know better)
-    L: 2.0
+    L: 3.5
     epsilon: 0.5
     k_v: 1.0
     k_a: 0.1
