@@ -5,20 +5,33 @@ from std_msgs.msg import Float64  # Change back to Float64
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import NavSatFix
 
-
 import yaml
 import math
 from rclpy.parameter import Parameter
 import numpy as np
+from autograd import jacobian # for los
+
 
 class ControllerNode(Node):
     def __init__(self):
         super().__init__('controller_node')
 
-        # Parameters for the controller
-        self.m_virtual = 50.0  # Virtual mass of the ASV (kg)
-        self.los = 20.0  # Lookahead distance for LOS (m)
+        # Parameters for LOS
+        self.params = {
+            "los": 20.0,   # Lookahead distance for LOS (m)
+            "U": 5.0,      # Desired speed [m/s]
+            "k": 0.3       # Parameter update gain
+        }  
         self.path_fcn = lambda s: np.array([s, 0.0])  # path function: straight line along x-axis
+        
+        # Initialize the state vector x_i
+        self.s = 0.0  # Initial path parameter
+        self.zeta = np.zeros(7)  # Adjust size based on your parameter vector
+        self._prev_control_time = None
+        
+
+        # Parameters for the controller
+        self.m_virtual = 20.0  # Virtual mass of the ASV (kg) (Keeping close to actual mass)
         self.k_v = 1.0  # Velocity control gain
         self.k_a = 0.5  # Acceleration control gain
         self.L = 3.5  # Length of the tether (m)
@@ -26,6 +39,13 @@ class ControllerNode(Node):
         self.k_psi = 1.0  # Heading control gain
         self.k_r = 1.0  # Yaw rate control gain
         self.declare_parameter('heading_mode', 'LOS') # 'LOS' or 'Path'
+
+        # System Model (See seperate section in this file for functions)
+        dimensions = (1.20, 0.93, 0.20) # Dimensions of the ASV [length, width, draft] in meters
+        xG = -0.2 # Center of Drag
+        tc = (1.0, 0.8, 1.2) # Time Constants [surge, sway, yaw]
+        V_current = (0.0, 0.0)  # [m/s] Just assume no current for now
+        self.mdl = self.asv_model(dimensions, xG, tc, V_current)
 
         # Subscriptions for ASV and ROV odometry
         self.blueboat_odom_sub = self.create_subscription(
@@ -160,8 +180,8 @@ class ControllerNode(Node):
         self.get_logger().info(f'ASV heading (rad): {self.blueboat_heading:.3f}')
 
         # Only proceed with control if we have all necessary data
-        if hasattr(self, 'blueboat_gps') and hasattr(self, 'rov_odom'):
-            self.control_step()
+        if self.blueboat_odom is not None and self.rov_odom is not None:
+            self.control_law()
 
     def rov_odom_callback(self, msg):
         """Handle odometry updates from the ROV.
@@ -239,21 +259,21 @@ class ControllerNode(Node):
         psi = self.blueboat_heading # heading
         v0 = self.blueboat_vel # Velocity of the ASV in the body frame
         r = self.blueboat_angular_vel[2] # Yaw rate (rad/s)
-        q = np.array[p0, psi] # Full ASV state
-        q_dot = np.array[v0, r] # ASV velocity state
+        q = np.array([p0.x, p0.y, psi]) # Full ASV state [x, y, psi]
+        q_dot = np.array([v0[0], v0[1], r]) # ASV velocity state [u, v, r]
         _ , theta, theta_dot = self.calculate_relative_position() # Angle and Angular velocity of the pendulum
-
-        s = x_i[0] # Path parameter
-        zeta = x_i[1:] # Parameter estimates vector
-
 
         # Get current time in seconds
         now = self.get_clock().now().nanoseconds * 1e-9
-        if hasattr(self, '_prev_time'):
-            delta = now - self._prev_time
+        if self._prev_control_time is not None:
+            dt = now - self._prev_control_time
         else:
-            delta = 0.0
-        self._prev_time = now
+            dt = 0.0
+        self._prev_control_time = now
+
+        # Use class member states
+        s = self.s  # Path parameter
+        zeta = self.zeta  # Parameter estimates vector
 
 
         # Headway computation
@@ -263,13 +283,13 @@ class ControllerNode(Node):
         v = v0 + self.epsilon * theta_dot * dGamma  # Velocity of the pendulum mass
 
         # Compute Reference Velocity (requires LOS)
-        v_ref, s_dot = self.line_of_sight(p, s, self.path_fcn, self.los)
+        v_ref, s_dot = self.line_of_sight(p, s, self.path_fcn, self.params)
 
         # Approximate acceleration of the pendulum mass
-        v_ref_plus, _ = self.line_of_sight(p + delta * v, self.s + delta * s_dot, self.path_fcn, self.los)
-        v_ref_dot = (v_ref_plus - v_ref) / delta
+        v_ref_plus, _ = self.line_of_sight(p + dt * v, self.s + dt * s_dot, self.path_fcn, self.params)
+        v_ref_dot = (v_ref_plus - v_ref) / dt
 
-        # Adaptive Control law
+        # Adaption law
         u_p, zeta_dot = self.pendulum_adaptive_controller(
             np.concatenate(([theta, theta_dot], p0, v0)),
             zeta,
@@ -294,7 +314,7 @@ class ControllerNode(Node):
             psi_ref = np.arctan2(v_ref[1], v_ref[0])
             # Approximate the derivative
             psi_ref_plus = np.arctan2(v_ref_dot[1], v_ref_dot[0])
-            r_ref = (psi_ref_plus - psi_ref) / delta
+            r_ref = (psi_ref_plus - psi_ref) / dt
 
         else:
             self.get_logger().error("Invalid heading_mode parameter. Use 'LOS' or 'Path'.")
@@ -307,53 +327,264 @@ class ControllerNode(Node):
         # Control Forces (Requires virtual mass controller)
         u = np.array([u_p, u_r])
             
-        tau = self.asv_virtual_mass_controller(q, q_dot, t, mdl, u, self.m_virtual)
+        tau = self.asv_virtual_mass_controller(q, q_dot, psi, self.mdl, u, self.m_virtual)
+        T_L, T_R = self.asv_thrust_allocation(tau, self.mdl)
+
+
+        # Update states with time integration
+        if dt > 0:
+            self.s += s_dot * dt  # Update path parameter
+            self.zeta += zeta_dot * dt  # Update parameter estimates
+
+        # Publish thrust commands
+        try:
+            self.port_thrust_pub.publish(Float64(data=float(T_L)))
+            self.stbd_thrust_pub.publish(Float64(data=float(T_R)))
+            self.get_logger().info('Thrust published successfully (T_L: {:.2f}, T_R: {:.2f})'.format(T_L, T_R))
+        except Exception as e:
+            self.get_logger().error(f'Failed to publish thrust: {e}')
         
-        x_i_dot = np.concatenate((s_dot, zeta_dot))
-        return tau, x_i_dot
+        return tau
 
 
 
+    def line_of_sight(self, p, s, path_fcn, params):
+        # Unpack parameters
+        U = params["U"]
+        delta = params["delta"]
+        k = params["k"]
 
+        # Compute the path point and its derivative
+        p_path = path_fcn(s)
+        p_path_dot = jacobian(path_fcn)(s)
+        theta_path = math.atan2(p_path_dot[1], p_path_dot[0])
+        R_path = np.array([[np.cos(theta_path), -np.sin(theta_path)], 
+                           [np.sin(theta_path), np.cos(theta_path)]])
+        delta_norm = np.norm(p_path_dot)
 
+        # Path-following error:
+        e = R_path.T @ (p - p_path)
+        e_x = e[0]
+        e_y = e[1]
+        D = np.sqrt(delta**2 + e_y**2)
 
-    def line_of_sight(self, p, s, path_fcn, path_fcn_dot, params):
         # LOS guidance law
+        v_LOS = U / D * R_path @ np.array([delta, -e_y])
+
+        # Path parameter update
+        s_dot = U / delta_norm * (delta/D * k*self.saturation(e_x))
+
         return v_LOS, s_dot
 
     def pendulum_adaptive_controller(self, x, zeta, v_ref, v_ref_dot, L, epsilon, k_v, k_a):
-        # Simplified adaptive controller for a pendulum system
-            return u, zeta_dot
+        """Adaptive controller for the pendulum dynamics."""
+        # Unpack states
+        theta = x[0]
+        theta_dot = x[1]
+        #p0 = x[2:3]
+        v0 = x[4:5]
+
+        Gamma = [np.cos(theta), np.sin(theta)]
+        dGamma = [-np.sin(theta), np.cos(theta)]
+
+        # Virtual output
+        # p = p0 + epsilon * L * Gamma
+        v = v0 + epsilon * L * theta_dot * dGamma
+        v_err = v - v_ref
+
+        v1 = v0 + L * theta_dot * dGamma # Velocity of the second mass
+        J = np.outer(dGamma, dGamma) # Jacobian matrix
+        
+        # Regressor
+        Y = np.concatenate(
+            [L * theta_dot**2 * Gamma - theta_dot/ (2 * (epsilon - 1)) * (np.outer(Gamma, dGamma) + np.outer(dGamma, Gamma)) * v_err - J * (v_ref_dot - k_v * v_err) / (epsilon - 1)],
+            v0,
+            L * theta_dot * dGamma,
+            np.eye(2),
+            J * v1,
+            J,
+            k_v * v_err - v_ref_dot
+        )
+
+        # Control force
+        u = -Y * zeta
+        # Adaption law
+        zeta_dot = -k_a * Y.T * v_err
+
+        return u, zeta_dot
+
+
+
+
+
+
+
+        return u, zeta_dot
     
     def pendulum_parameter_vector(self, m0, m, c0, c, epsilon, V_c=None):
+        """Constructs the parameter vector for the adaptive controller of a pendulum system."""
+        zeta = np.array([
+            m * (1 - epsilon) - m0 * epsilon,
+            -(c + c0),
+            -c,
+            (c + c0) * V_c,
+            c * (1 + m0 + epsilon / (m * (epsilon -1))),
+            -c * (1 + m0 + epsilon / (m * (epsilon -1))) * V_c,
+            m + m0
+        ]).T
+
         return zeta
 
     def heading_control(self, desired_heading, current_heading):
+        # Did not find this lol. Think I have already implemented it above.
         return k_psi * heading_error
 
-    def asv_virtual_mass_controller(self, heading_cmd):
-        return heading_cmd / m_virtual
+    def asv_virtual_mass_controller(self, q, q_dot, psi, mdl, u, m_virtual):
+        """Virtual mass controller (+ Thrust Allocation) for underactuated ASVs."""
+        # Unpack states
+        u_p, u_r = u
 
-    # --- Helpers (numerical derivatives) ---
+        # Step1: Converting desired planer force to surge direction
+        F_u, psi_d, phi = self.underactuated_transform(u_p, psi)
 
-    def numerical_derivative(f, x, h=1e-6):
+        # Step2: Desired body-frame force vector
+        tau_d = np.array([F_u, 0.0, u_r])
+
+        # Step3: Compute mass and damping terms
+        M, b = self.mass_Coriolis(mdl, q, q_dot)
+
+        # Step4: Virtual mass dynamic compentation
+        tau = (M @ tau_d) / m_virtual - b
+        tau[1] = 0.0  # No sway force
+
+        return tau
+
+
+    def asv_thrust_allocation(self, tau, mdl):
+        W = mdl["dimensions"][1]
+        l = W / 2.0 # Distance from centerline to each thruster
+
+        # Allocation matrix B maps [T_L, T_R] → [tau_u, tau_v, tau_r]
+        B = np.array([
+            [1.0, 1.0],   # surge (sum of thrusters)
+            [0.0, 0.0],   # sway (no actuation)
+            [ l , -l ]    # yaw (moment arm)
+        ])
+
+        # Solve for thruster forces (least-squares in case overdetermined)
+        T = np.linalg.pinv(B) @ tau
+        T_L, T_R = float(T[0]), float(T[1])
+
+        return T_L, T_R
+    
+    # --- Helpers ---
+
+    def numerical_derivative(self, f, x, h=1e-6):
         """Simple central difference derivative for scalar x."""
         return (np.array(f(x + h)) - np.array(f(x - h))) / (2 * h)
+    
+    def saturation(self, x):
+        """Implements a smooth saturation function that maps R -> [-1,1]"""
+        return x / np.sqrt(1 + x**2)
+    
+    def underactuated_transform(self, u_p, psi):
+        """Implements Josef's rule for Virtual mass for underactuated ASVs."""
+        ux, uy = u_p
+        norm_u = math.hypot(ux, uy)
+        if norm_u < 1e-6:
+            return 0.0, psi, 0.0
+
+        phi = math.atan2(uy, ux)
+        if math.cos(phi - psi) >= 0:
+            psi_d = phi
+            F_u = norm_u
+        else:
+            psi_d = ((phi + np.pi) + np.pi) % (2*np.pi) - np.pi
+            F_u = -norm_u
+        return F_u, psi_d, phi
+    
+    def mass_Coriolis(mdl, q, q_dot):
+        """
+        Compute the mass matrix M and damping vector b for the ASV model.
+        Equivalent to the EulerLagrangeX._mass_Coriolis! call in Julia. (source: gpt)
+        """
+        psi = q[2]
+        u, v, r = q_dot  # body-frame velocities
+
+        m = mdl["mass"]
+        J = mdl["inertia"]
+        Xu, Yv, Nr, Yr = mdl["Xu"], mdl["Yv"], mdl["Nr"], mdl["Yr"]
+        Dul, Dvl, Drl = mdl["Dul"], mdl["Dvl"], mdl["Drl"]
+
+        # --- Mass matrix (simplified rigid-body + added mass approximation)
+        M = np.array([
+            [m + Xu, 0, 0],
+            [0, m + Yv, m * mdl["xG"]],
+            [0, m * mdl["xG"], J + Nr]
+        ])
+
+        # --- Coriolis + damping term (simplified)
+        C = np.array([
+            [0, -m * r, 0],
+            [m * r, 0, 0],
+            [0, 0, 0]
+        ])
+
+        D = np.diag([Dul, Dvl, Drl])
+
+        b = (C + D) @ q_dot
+
+        return M, b
+    
 
     ####################### Model ################################
-    def asv_model(self):
+    def asv_model(dimensions, xG, time_constants, V_current):
+        """Create a simple dynamic model of the ASV based on its dimensions and time constants."""
         # ASV dynamic model parameters
+        L = dimensions[0] # Length (m)
+        W = dimensions[1] # Width (m)
+        B = dimensions[2] # Draft (m)
+        rho_water = 1025 # Density of water (kg/m^3)
+
+        m = L*W*B*rho_water # Mass (kg)
+        J = m*(L**2 + W**2)/12 # Moment of inertia (kg*m^2) Assuming rectangular prism
+        Xu = 0.6*m # Surge linear drag
+        Yv = 0.4*m # Sway linear drag
+        Nr = 0.1*J # Yaw linear drag
+        Yr = 0.2*J # Yaw cross-coupling drag
+
+        # Daming coefficients
+        Tu = time_constants[0] # Surge time constant (s)
+        Tv = time_constants[1] # Sway time constant (s)
+        Tr = time_constants[2] # Yaw time constant (s)
+        Dul = (m + Xu) / Tu # Surge damping
+        Dvl = (m + Yv) / Tv # Sway damping
+        Drl = (J + Nr) / Tr # Yaw damping
+        Duq = 0.0 # Surge quadratic drag
+        Dvq = 0.0 # Sway quadratic drag
+        Drq = 0.0 # Yaw quadratic drag
+
+        # Packaging model into dictionary
         mdl = {
-            'm': 100.0,  # Mass (kg)
-            'I_z': 10.0,  # Yaw moment of inertia (kg*m^2)
-            'X_u_dot': -20.0,  # Added mass in surge
-            'Y_v_dot': -30.0,  # Added mass in sway
-            'N_r_dot': -5.0,   # Added mass in yaw
-            'D_u': -50.0,     # Linear drag in surge
-            'D_v': -100.0,    # Linear drag in sway
-            'D_r': -20.0      # Linear drag in yaw
+            "dimensions": (L, W, B),
+            "xG": xG,
+            "mass": m,
+            "inertia": J,
+            "Xu": Xu,
+            "Yv": Yv,
+            "Nr": Nr,
+            "Yr": Yr,
+            "Dul": Dul,
+            "Dvl": Dvl,
+            "Drl": Drl,
+            "Duq": Duq,
+            "Dvq": Dvq,
+            "Drq": Drq,
+            "rho_water": rho_water,
+            "Vfunc": V_current
         }
         return mdl
+
 
 
 def main(args=None):

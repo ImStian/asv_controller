@@ -18,7 +18,7 @@ class ControllerNode(Node):
         self.declare_parameter('U', 1.0)
         self.declare_parameter('Delta', 5.0)
         self.declare_parameter('k', 0.5)
-        self.declare_parameter('L', 3.5)
+        self.declare_parameter('L', 2.0)
         self.declare_parameter('epsilon', 0.5)
         self.declare_parameter('k_v', 1.0)
         self.declare_parameter('k_a', 0.1)
