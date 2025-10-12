@@ -14,7 +14,7 @@ setup(
         ('share/' + package_name + '/launch', ['launch/asv_controller.launch.py']),
         ('share/' + package_name, ['circle_radius_3m.yaml']),
     ],
-    install_requires=['setuptools', 'numpy', 'autograd'],
+    install_requires=['setuptools', 'numpy', 'autograd', 'pyyaml', 'rclpy'],
     zip_safe=True,
     maintainer='User',
     maintainer_email='user@example.com',
