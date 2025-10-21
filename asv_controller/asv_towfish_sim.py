@@ -56,11 +56,12 @@ class AsvTowfishSim(Node):
 		self.dt = 1.0 / max(rate_hz, 1.0)
 
 		# ASV states: eta = [x, y, psi], nu = [u, v, r]
-		self.eta = np.zeros(3, dtype=float)
+		self.eta = np.array([0, 1.0, 0.0], dtype=float)
+	
 		self.nu = np.zeros(3, dtype=float)
 
 		# Towfish simplified mass-spring in inertial frame.
-		self.tow_pos = np.array([-3.5, 0.0], dtype=float)
+		self.tow_pos = np.array([-3.5, 1.0], dtype=float)
 		self.tow_vel = np.zeros(2, dtype=float)
 		self.tether_length = float(self.declare_parameter('tether_length', 3.5).get_parameter_value().double_value)
 		self.tow_mass = float(self.declare_parameter('tow_mass', 25.0).get_parameter_value().double_value)
@@ -73,7 +74,9 @@ class AsvTowfishSim(Node):
 
 		# Reference path for plotting
 		path_param = self.declare_parameter('path_file', '').get_parameter_value().string_value
-		self.path_points = self._load_path_points(path_param)
+		pts = self._load_path_points(path_param)
+		self.path_points = np.array(pts, dtype=float)
+		self._update_path_geometry(self.path_points)
 
 		# Real-time plotting setup (optional).
 		self.enable_plot = bool(self.declare_parameter('enable_plot', True).get_parameter_value().bool_value)
@@ -286,7 +289,7 @@ class AsvTowfishSim(Node):
 			return
 		self._asv_history.append(self.eta[:2].copy())
 		self._tow_history.append(self.tow_pos.copy())
-		if self.show_s_point:
+		if self.show_s_point and self._segments_valid():
 			s_point = self._compute_s_point()
 			self._s_history.append(s_point)
 		self._plot_counter += 1
@@ -312,12 +315,42 @@ class AsvTowfishSim(Node):
 			self.get_logger().warning(f'Plot update failed: {exc}')
 			self.enable_plot = False
 
+	def _segments_valid(self) -> bool:
+		return self._segment_starts is not None and self._segment_vectors is not None and len(self._segment_starts) > 0
+
 	def _compute_s_point(self) -> np.ndarray:
-		"""Compute the current LOS point on the reference path."""
-		if self.path_points is None or len(self.path_points) < 2:
+		"""Project the ASV position onto the closest point along the polyline path."""
+		if not self._segments_valid():
 			return self.eta[:2].copy()
-		closest_idx = np.argmin(np.linalg.norm(self.path_points - self.eta[:2], axis=1))
-		return self.path_points[closest_idx]
+		pos = self.eta[:2]
+		best_point = self._segment_starts[0]
+		best_dist = float('inf')
+		for start, vec, length in zip(self._segment_starts, self._segment_vectors, self._segment_lengths):
+			if length <= 1e-9:
+				continue
+			delta = pos - start
+			t = float(np.dot(delta, vec) / (length * length))
+			t = min(1.0, max(0.0, t))
+			candidate = start + t * vec
+			dist = float(np.linalg.norm(pos - candidate))
+			if dist < best_dist:
+				best_dist = dist
+				best_point = candidate
+		return best_point.copy()
+
+	def _update_path_geometry(self, points: Optional[np.ndarray]):
+		if points is None or len(points) < 2:
+			self._segment_starts = None
+			self._segment_vectors = None
+			self._segment_lengths = None
+			return
+		pts = np.array(points, dtype=float)
+		seg_vecs = pts[1:] - pts[:-1]
+		seg_len = np.linalg.norm(seg_vecs, axis=1)
+		mask = seg_len > 1e-6
+		self._segment_starts = pts[:-1][mask]
+		self._segment_vectors = seg_vecs[mask]
+		self._segment_lengths = seg_len[mask]
 
 	def _load_path_points(self, path_file: str) -> Optional[np.ndarray]:
 		"""Load reference path waypoints for visualization."""

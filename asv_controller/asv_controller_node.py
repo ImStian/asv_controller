@@ -2,6 +2,7 @@
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float64  # Change back to Float64
+from std_msgs.msg import Float64MultiArray
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import NavSatFix
 
@@ -11,6 +12,8 @@ from rclpy.parameter import Parameter
 import numpy as np
 from autograd import jacobian # for los
 import os
+
+from ament_index_python.packages import get_package_share_directory, PackageNotFoundError
 
 import logging
 import functools
@@ -77,32 +80,67 @@ class ControllerNode(Node):
 
         # Parameters for LOS
         self.params = {
-            "los": 20.0,   # Lookahead distance for LOS (m)
-            "U": 5.0,      # Desired speed [m/s]
+            "los": 5.0,   # Lookahead distance for LOS (m)
+            "U": 1.0,      # Desired speed [m/s]
             "k": 0.3       # Parameter update gain
         }  
-        # Default straight-line path (will be replaced if a waypoint YAML is available)
-        self.path_fcn = lambda s: np.array([s, 0.0])  # path function: straight line along x-axis
+        # Path state – remains None until a waypoint message is received (or a file is explicitly requested).
+        self.path_fcn = None
+        self.path_fcn_dot = None
+        self._wp_total = None
+        self._wp_closed = False
+        self.use_waypoints = False
+        self._waiting_for_path_logged = False
 
-        # Try loading a default waypoint file (circle) placed in the package root
-        try:
+        # Optional: load a waypoint file when explicitly requested via parameter.
+        self.declare_parameter('load_default_waypoints', True) # default to True for simulation, use false and load them yourself if you want to change on the fly
+        if self.get_parameter('load_default_waypoints').get_parameter_value().bool_value:
+            candidate_files = []
+            try:
+                share_path = get_package_share_directory('asv_controller')
+                candidate_files.append(os.path.join(share_path, 'circle_radius_3m.yaml'))
+            except (PackageNotFoundError, EnvironmentError):
+                pass
+
             pkg_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), '../..'))
-            yaml_path = os.path.join(pkg_dir, 'circle_radius_3m.yaml')
-            self.get_logger().info(f'Looking for waypoints file at: {yaml_path}')
-            if os.path.exists(yaml_path):
-                with open(yaml_path, 'r') as fh:
-                    data = yaml.safe_load(fh)
-                if data and 'waypoints' in data and isinstance(data['waypoints'], list):
+            candidate_files.append(os.path.join(pkg_dir, 'circle_radius_3m.yaml'))
+
+            loaded = False
+            for yaml_path in candidate_files:
+                self.get_logger().info(f'Looking for waypoints file at: {yaml_path}')
+                if not os.path.exists(yaml_path):
+                    continue
+                try:
+                    with open(yaml_path, 'r') as fh:
+                        data = yaml.safe_load(fh)
+                except Exception as exc:
+                    self.get_logger().warn(f'Failed reading waypoint file {yaml_path}: {exc}')
+                    continue
+
+                if not (data and 'waypoints' in data and isinstance(data['waypoints'], list)):
+                    self.get_logger().warn(f'Waypoint file {yaml_path} missing "waypoints" list; skipping')
+                    continue
+
+                try:
                     pts = [(float(x), float(y)) for x, y in data['waypoints']]
                     f, fdot, total = self.build_piecewise_path(pts)
-                    self.path_fcn = lambda s, _f=f: np.array(_f(s), dtype=float)
-                    self.path_fcn_dot = lambda s, _fd=fdot: np.array(_fd(s), dtype=float)
-                    self._wp_points = pts
-                    self._wp_total = total
-                    self.use_waypoints = True
-                    self.get_logger().info(f'Loaded default waypoints from {yaml_path} (total length {total:.2f} m)')
-        except Exception as e:
-            self.get_logger().warn(f'Could not load default waypoint file: {e}')
+                except Exception as exc:
+                    self.get_logger().warn(f'Could not parse waypoints from {yaml_path}: {exc}')
+                    continue
+
+                self.path_fcn = lambda s, _f=f: np.array(_f(s), dtype=float)
+                self.path_fcn_dot = lambda s, _fd=fdot: np.array(_fd(s), dtype=float)
+                self._wp_points = pts
+                self._wp_total = total
+                self._wp_closed = self._detect_closed_path(pts)
+                self.use_waypoints = True
+                self._waiting_for_path_logged = False
+                self.get_logger().info(f'Loaded default waypoints from {yaml_path} (total length {total:.2f} m)')
+                loaded = True
+                break
+
+            if not loaded:
+                self.get_logger().warn('Default waypoint file could not be located; waiting for /waypoints input.')
         
         # Initialize the state vector x_i
         self.s = 0.0  # Initial path parameter
@@ -113,16 +151,32 @@ class ControllerNode(Node):
         # Parameters for the controller
         self.m_virtual = 80.0  # Virtual mass of the ASV (kg) (~1/3 of actual mass for better responsiveness)
         self.k_v = 1.5  # Velocity control gain
-        self.k_a = 1.5  # Acceleration control gain
+        self.k_a = 1.5  # Adaptation control gain
         self.L = 3.5  # Length of the tether (m)
         self.epsilon = 0.7  # Small positive constant for adaptive controller
         self.k_psi = 2.0  # Heading control gain
         self.k_r = 2.0  # Yaw rate control gain
-        self.declare_parameter('heading_mode', 'Path') # 'LOS' or 'Path'
+        self.declare_parameter('heading_mode', 'LOS')  # 'LOS' or 'Path'
+        self.declare_parameter('controller_mode', 'MRAC')  # 'MRAC' or 'PID'
+        self.declare_parameter('pid_kp', 5.0)
+        self.declare_parameter('pid_ki', 0.2)
+        self.declare_parameter('pid_kd', 0.5)
+        self.declare_parameter('pid_integral_limit', 30.0)
+        self.pid_integral = np.zeros(2, dtype=float)
+        self.pid_prev_error = np.zeros(2, dtype=float)
+        self._last_controller_mode = self.get_parameter('controller_mode').get_parameter_value().string_value.upper()
+        self.declare_parameter('max_planar_force', 400.0)
+        self.declare_parameter('max_yaw_moment', 75.0)
+        self.max_planar_force = float(self.get_parameter('max_planar_force').get_parameter_value().double_value)
+        self.max_yaw_moment = float(self.get_parameter('max_yaw_moment').get_parameter_value().double_value)
         # Thruster safety parameters
         self.declare_parameter('thruster_sign_port', 1.0)
         self.declare_parameter('thruster_sign_stbd', 1.0)
         self.declare_parameter('max_thrust', 50.0)
+
+        self.thruster_sign_port = float(self.get_parameter('thruster_sign_port').get_parameter_value().double_value)
+        self.thruster_sign_stbd = float(self.get_parameter('thruster_sign_stbd').get_parameter_value().double_value)
+        self.max_thrust = float(self.get_parameter('max_thrust').get_parameter_value().double_value)
 
         # System Model (See seperate section in this file for functions)
         dimensions = (1.20, 0.93, 0.20) # Dimensions of the ASV [length, width, draft] in meters
@@ -130,6 +184,28 @@ class ControllerNode(Node):
         tc = (1.0, 0.8, 1.2) # Time Constants [surge, sway, yaw]
         V_current = (0.0, 0.0)  # [m/s] Just assume no current for now
         self.mdl = self.asv_model(dimensions, xG, tc, V_current)
+
+        physical_planar_limit = 2.0 * self.max_thrust
+        if self.max_planar_force > physical_planar_limit:
+            self.get_logger().warn(
+                'max_planar_force exceeds what the thrusters can supply ({} > {}). Clamping to {}.'.format(
+                    self.max_planar_force,
+                    physical_planar_limit,
+                    physical_planar_limit,
+                )
+            )
+            self.max_planar_force = physical_planar_limit
+
+        physical_yaw_limit = self.max_thrust * dimensions[1]
+        if self.max_yaw_moment > physical_yaw_limit:
+            self.get_logger().warn(
+                'max_yaw_moment exceeds the differential thrust capability ({} > {}). Clamping to {}.'.format(
+                    self.max_yaw_moment,
+                    physical_yaw_limit,
+                    physical_yaw_limit,
+                )
+            )
+            self.max_yaw_moment = physical_yaw_limit
 
         # Subscriptions for ASV and ROV odometry
         self.blueboat_odom_sub = self.create_subscription(
@@ -169,6 +245,15 @@ class ControllerNode(Node):
             '/model/blueboat/joint/motor_stbd_joint/cmd_thrust',
             10)
         self.get_logger().info('Controller node started.')
+
+        # Waypoint subscription (optional path input from external source)
+        waypoint_topic = self.declare_parameter('waypoint_topic', '/waypoints').get_parameter_value().string_value
+        self.waypoint_sub = self.create_subscription(
+            Float64MultiArray,
+            waypoint_topic,
+            self.waypoints_callback,
+            10)
+        self.get_logger().info(f'Subscribed to {waypoint_topic} for waypoint updates.')
 
     #########################   COORDINATE CONVERSION  ################################
     def lla_to_enu(self, lat, lon, ref_lat, ref_lon, ref_alt):
@@ -347,6 +432,18 @@ class ControllerNode(Node):
         theta_dot = np.clip(theta_dot, -2.0, 2.0)
 
         return distance, angle, theta_dot
+
+    def _get_towfish_state(self):
+        if self.rov_odom is None:
+            return None, None
+        try:
+            pos = self.rov_odom.pose.pose.position
+            vel = self.rov_odom.twist.twist.linear
+            tow_pos = np.array([float(pos.x), float(pos.y)], dtype=float)
+            tow_vel = np.array([float(vel.x), float(vel.y)], dtype=float)
+            return tow_pos, tow_vel
+        except Exception:
+            return None, None
     
     ######################## MRAC CONTROLLER ##############################
     @log_variables
@@ -358,11 +455,18 @@ class ControllerNode(Node):
                 self.blueboat_odom.pose.pose.position.y,
                 self.blueboat_odom.pose.pose.position.z]
         psi = self.blueboat_heading # heading
-        v0 = self.blueboat_vel # Velocity of the ASV in the body frame
-        self.get_logger().info(f'position p0: {p0}, psi: {psi}, v0: {v0}')
-        r = self.blueboat_angular_vel[2] # Yaw rate (rad/s)
-        q = np.array([p0[0], p0[1], psi]) # Full ASV state [x, y, psi]
-        q_dot = np.array([v0[0], v0[1], r]) # ASV velocity state [u, v, r]
+        v0_body = np.array(self.blueboat_vel[:2], dtype=float)  # Body-frame surge/sway
+        r = self.blueboat_angular_vel[2]  # Yaw rate (rad/s)
+
+        # Transform body-frame planar velocity into navigation frame for path control
+        R_nb = np.array([[np.cos(psi), -np.sin(psi)],
+                         [np.sin(psi),  np.cos(psi)]])
+        v0_nav = R_nb @ v0_body
+
+        self.get_logger().info(f'position p0: {p0}, psi: {psi}, v_body: {v0_body.tolist()}, v_nav: {v0_nav.tolist()}')
+
+        q = np.array([p0[0], p0[1], psi])  # Full ASV state [x, y, psi]
+        q_dot = np.array([v0_body[0], v0_body[1], r])  # Body-frame velocity state [u, v, r]
         
         rel = self.calculate_relative_position()
         if rel is None or rel[0] is None:
@@ -391,13 +495,19 @@ class ControllerNode(Node):
         dGamma = np.array([-np.sin(theta), np.cos(theta)])
         # Convert p0 to a 2D numpy array
         p = np.array([p0[0], p0[1]]) + self.epsilon * self.L * Gamma  # Position of the pendulum mass
-        v = np.array(v0[:2]) + self.epsilon * self.L * theta_dot * dGamma  # Velocity of the pendulum mass
+        v = np.array(v0_nav).reshape(2) + self.epsilon * self.L * theta_dot * dGamma  # Velocity of the pendulum mass
         self.get_logger().info('p0: {}, p: {}'.format(p0, p))
 
         # Log current state before LOS
         self.get_logger().info(f'Current state - s: {s}, p: {p.tolist()}, theta: {theta}, theta_dot: {theta_dot}')
 
         # Compute Reference Velocity (requires LOS)
+        if self.path_fcn is None:
+            if not self._waiting_for_path_logged:
+                self.get_logger().warn('Waiting for waypoint path before running LOS guidance.')
+                self._waiting_for_path_logged = True
+            return
+
         v_ref, s_dot = self.line_of_sight(p, s, self.path_fcn, self.params, dt)
         self.get_logger().info(f'After LOS - v_ref: {v_ref.tolist()}, s_dot: {s_dot}')
 
@@ -406,33 +516,74 @@ class ControllerNode(Node):
         v_ref_dot = (v_ref_plus - v_ref) / dt
         self.get_logger().info(f'Reference acceleration - v_ref_dot: {v_ref_dot.tolist()}')
 
-        # Adaption law
-        u_p, zeta_dot = self.pendulum_adaptive_controller(
-            np.concatenate(([theta, theta_dot], [p0[0], p0[1]], v0[:2])),
-            zeta,
-            v_ref,
-            v_ref_dot,
-            self.L,
-            self.epsilon,
-            self.k_v,
-            self.k_a,
-            psi
-        )
+        # Reference path geometry for PID mode
+        p_ref = np.array(self.path_fcn(s), dtype=float)
+        path_dot_fn = getattr(self, 'path_fcn_dot', None)
+        if callable(path_dot_fn):
+            p_tangent = np.array(path_dot_fn(s), dtype=float)
+        else:
+            p_tangent = np.array(self.numerical_derivative(self.path_fcn, s, dt), dtype=float)
+        if np.linalg.norm(p_tangent) < 1e-9:
+            p_tangent = np.array([1.0, 0.0])
+        p_ref_dot = s_dot * p_tangent
+
+        controller_mode = self.get_parameter('controller_mode').get_parameter_value().string_value.upper()
+        if controller_mode != getattr(self, '_last_controller_mode', controller_mode):
+            self.pid_integral = np.zeros_like(self.pid_integral)
+            self.pid_prev_error = np.zeros_like(self.pid_prev_error)
+            self._last_controller_mode = controller_mode
+
+        if controller_mode == 'PID':
+            # Use actual towfish state if available for PID control
+            tow_pos, tow_vel = self._get_towfish_state()
+            pos_input = tow_pos if tow_pos is not None else p
+            vel_input = tow_vel if tow_vel is not None else v
+            u_p = self.pid_motion_controller(pos_input, vel_input, p_ref, p_ref_dot, dt)
+            zeta_dot = np.zeros_like(zeta)
+        else:
+            # Adaptive MRAC controller
+            u_p, zeta_dot = self.pendulum_adaptive_controller(
+                np.concatenate(([theta, theta_dot], [p0[0], p0[1]], v0_nav)),
+                zeta,
+                v_ref,
+                v_ref_dot,
+                self.L,
+                self.epsilon,
+                self.k_v,
+                self.k_a,
+                psi
+            )
+            self._last_controller_mode = controller_mode
+
+        # Limit planar force to keep thrusters within range and retain yaw authority
+        u_p = np.asarray(u_p, dtype=float).reshape(2)
+        u_p_norm = float(np.linalg.norm(u_p))
+        if u_p_norm > self.max_planar_force > 0.0:
+            scale = self.max_planar_force / u_p_norm
+            u_p *= scale
 
         # Heading control to align ASV with the pendulum direction
-        if self.get_parameter('heading_mode').get_parameter_value().string_value == 'LOS':
+        heading_mode = self.get_parameter('heading_mode').get_parameter_value().string_value
+        if heading_mode == 'LOS':
+            # Aim the vessel directly along the LOS velocity vector
+            if np.linalg.norm(v_ref) < 1e-6:
+                psi_ref = psi
+                r_ref = 0.0
+            else:
+                psi_ref = float(np.arctan2(v_ref[1], v_ref[0]))
+                psi_ref_plus = float(np.arctan2(v_ref_plus[1], v_ref_plus[0]))
+                yaw_delta = ((psi_ref_plus - psi_ref + np.pi) % (2 * np.pi)) - np.pi
+                r_ref = yaw_delta / dt
+
+        elif heading_mode == 'Path':
             def path_angle(_s):
                 dp = self.numerical_derivative(self.path_fcn, _s, dt)
                 return math.atan2(dp[1], dp[0])
-            
-            psi_ref = path_angle(self.s)
-            r_ref = self.numerical_derivative(path_angle, self.s, dt) * s_dot
 
-        elif self.get_parameter('heading_mode').get_parameter_value().string_value == 'Path':
-            psi_ref = np.arctan2(v_ref[1], v_ref[0])
-            # Use the predicted velocity instead of the acceleration vector when forming r_ref
-            psi_ref_plus = np.arctan2(v_ref_plus[1], v_ref_plus[0])
-            r_ref = (psi_ref_plus - psi_ref) / dt
+            psi_ref = path_angle(self.s)
+            psi_dot_est = self.numerical_derivative(path_angle, self.s, dt) * s_dot
+            yaw_delta = ((psi_dot_est * dt) + np.pi) % (2 * np.pi) - np.pi
+            r_ref = yaw_delta / dt
 
         else:
             self.get_logger().error("Invalid heading_mode parameter. Use 'LOS' or 'Path'.")
@@ -441,18 +592,12 @@ class ControllerNode(Node):
         # Heading Control Law
         psi_error = ((psi - psi_ref + np.pi) % (2 * np.pi)) - np.pi  # Wrap to [-pi, pi]
         u_r = -self.k_psi * psi_error - self.k_r * (r - r_ref)
+        u_r = float(np.clip(u_r, -self.max_yaw_moment, self.max_yaw_moment))
 
-        # Create control input vector - Fix the inhomogeneous shape issue
-        u = np.array([*u_p, u_r])  # Unpack u_p components and append u_r
-        # Alternative: u = np.concatenate([u_p, [u_r]])
-        self.get_logger().info('u {}'.format(u))
-
- 
-
-        tau = self.asv_virtual_mass_controller(q, q_dot, psi, self.mdl, u, self.m_virtual)
-        max_tau = 1e4
-        tau = np.clip(tau, -max_tau, max_tau)
-        self.get_logger().info('Tau {}'.format(tau))
+        # Map planar force + yaw moment directly to thruster commands
+        F_u, _, _ = self.underactuated_transform(u_p, psi)
+        tau = np.array([F_u, 0.0, u_r], dtype=float)
+        self.get_logger().info(f'Desired body wrench (surge/yaw): [{tau[0]:.3f}, {tau[2]:.3f}]')
 
         T_L, T_R = self.asv_thrust_allocation(tau, self.mdl)
 
@@ -462,8 +607,11 @@ class ControllerNode(Node):
             self.s += s_dot * dt  # Update path parameter
             # clamp s to path total (if available)
             try:
-                if hasattr(self, '_wp_total') and self._wp_total is not None:
-                    self.s = float(np.clip(self.s, 0.0, max(0.0, float(self._wp_total))))
+                if hasattr(self, '_wp_total') and self._wp_total is not None and self._wp_total > 0.0:
+                    if getattr(self, '_wp_closed', False):
+                        self.s = float(np.mod(self.s, float(self._wp_total)))
+                    else:
+                        self.s = float(np.clip(self.s, 0.0, max(0.0, float(self._wp_total))))
             except Exception:
                 pass
 
@@ -485,17 +633,20 @@ class ControllerNode(Node):
 
         # Publish thrust commands
         try:
-            # Apply configurable sign and clamp to avoid extreme commands that flip the vehicle
-            sign_port = float(self.get_parameter('thruster_sign_port').get_parameter_value().double_value)
-            sign_stbd = float(self.get_parameter('thruster_sign_stbd').get_parameter_value().double_value)
-            max_thrust = float(self.get_parameter('max_thrust').get_parameter_value().double_value)
-
-            T_L_pub = float(np.clip(T_L * sign_port, -max_thrust, max_thrust))
-            T_R_pub = float(np.clip(T_R * sign_stbd, -max_thrust, max_thrust))
+            raw_thrusters = np.array([
+                T_L * self.thruster_sign_port,
+                T_R * self.thruster_sign_stbd,
+            ], dtype=float)
+            adjusted_thrusters = self._apply_thruster_limits(raw_thrusters, self.max_thrust)
+            T_L_pub, T_R_pub = adjusted_thrusters.tolist()
 
             # Publish and log diagnostics
             self.port_thrust_pub.publish(Float64(data=T_L_pub))
             self.stbd_thrust_pub.publish(Float64(data=T_R_pub))
+            if np.any(np.abs(raw_thrusters) > self.max_thrust + 1e-6):
+                self.get_logger().debug('Thruster saturation: requested ({:.3f}, {:.3f}) -> limited ({:.3f}, {:.3f})'.format(
+                    raw_thrusters[0], raw_thrusters[1], T_L_pub, T_R_pub
+                ))
             self.get_logger().info('Thrust published (raw T_L: {:.3f}, raw T_R: {:.3f}) -> published (T_L: {:.3f}, T_R: {:.3f})'.format(T_L, T_R, T_L_pub, T_R_pub))
         except Exception as e:
             self.get_logger().error(f'Failed to publish thrust: {e}')
@@ -681,6 +832,28 @@ class ControllerNode(Node):
 
         return u.flatten(), zeta_dot.flatten()
 
+    def pid_motion_controller(self, p, v, p_ref, p_ref_dot, dt):
+        kp = float(self.get_parameter('pid_kp').get_parameter_value().double_value)
+        ki = float(self.get_parameter('pid_ki').get_parameter_value().double_value)
+        kd = float(self.get_parameter('pid_kd').get_parameter_value().double_value)
+        integral_limit = float(self.get_parameter('pid_integral_limit').get_parameter_value().double_value)
+
+        error = p_ref - p
+        if dt > 0:
+            self.pid_integral += error * dt
+        if integral_limit > 0:
+            norm_int = float(np.linalg.norm(self.pid_integral))
+            if norm_int > integral_limit:
+                self.pid_integral = (self.pid_integral / norm_int) * integral_limit
+
+        derivative = (error - self.pid_prev_error) / max(dt, 1e-6)
+        self.pid_prev_error = error
+
+        control = kp * error + ki * self.pid_integral + kd * derivative
+        # Add a modest feedforward term aligned with desired path motion
+        control += p_ref_dot
+        return control
+
     @log_variables
     def asv_virtual_mass_controller(self, q, q_dot, psi, mdl, u, m_virtual):
         """Virtual mass controller (+ Thrust Allocation) for underactuated ASVs."""
@@ -726,6 +899,20 @@ class ControllerNode(Node):
         T_L, T_R = float(T[0]), float(T[1])
 
         return T_L, T_R
+
+    def _apply_thruster_limits(self, thrusters, max_thrust):
+        if max_thrust <= 0.0:
+            return thrusters
+
+        left, right = [float(x) for x in thrusters]
+        diff = 0.5 * (left - right)
+        diff = float(np.clip(diff, -max_thrust, max_thrust))
+        common = 0.5 * (left + right)
+        allowable_common = max_thrust - abs(diff)
+        if allowable_common < 0.0:
+            allowable_common = 0.0
+        common = float(np.clip(common, -allowable_common, allowable_common))
+        return np.array([common + diff, common - diff], dtype=float)
     
     # --- Helpers ---
 
@@ -783,6 +970,13 @@ class ControllerNode(Node):
 
         return path_fcn_s, path_fcn_dot_s, total
 
+    def _detect_closed_path(self, pts, tol=1e-3):
+        if len(pts) < 2:
+            return False
+        first = np.array(pts[0], dtype=float)
+        last = np.array(pts[-1], dtype=float)
+        return float(np.linalg.norm(first - last)) <= tol
+
     @log_variables
     def waypoints_callback(self, msg):
         """Accept Float32MultiArray messages containing either [x,y] pairs (2*N) or [x,y,z] triplets (3*N).
@@ -812,6 +1006,7 @@ class ControllerNode(Node):
         # store helper info
         self._wp_points = pts
         self._wp_total = total
+        self._wp_closed = self._detect_closed_path(pts)
         self.use_waypoints = True
 
         # Set path_fcn to use the new piecewise function and provide analytic derivative when possible
@@ -824,6 +1019,8 @@ class ControllerNode(Node):
         # attach analytic derivative for potential autograd use
         self.path_fcn = path_wrapper
         self.path_fcn_dot = path_wrapper_dot
+        self.s = 0.0  # restart path parameter whenever a new track arrives
+        self._waiting_for_path_logged = False
         self.get_logger().info(f'Waypoints received: {pts}; total path length: {total:.2f}')
 
     @log_variables
