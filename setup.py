@@ -11,10 +11,14 @@ setup(
     data_files=[
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        ('share/' + package_name + '/launch', ['launch/asv_controller.launch.py']),
+        ('share/' + package_name + '/launch', [
+            'launch/asv_controller.launch.py',
+            'launch/asv_towfish_sim.launch.py',
+            'launch/asv_controller_with_sim.launch.py',
+        ]),
         ('share/' + package_name, ['circle_radius_3m.yaml']),
     ],
-    install_requires=['setuptools', 'numpy', 'autograd', 'pyyaml', 'rclpy'],
+    install_requires=['setuptools', 'numpy', 'autograd', 'pyyaml', 'rclpy', 'matplotlib'],
     zip_safe=True,
     maintainer='User',
     maintainer_email='user@example.com',
@@ -24,6 +28,7 @@ setup(
     entry_points={
         'console_scripts': [
             'asv_controller_node = asv_controller.asv_controller_node:main',
+            'asv_towfish_sim = asv_controller.asv_towfish_sim:main',
         ],
     },
     python_requires='>=3.6',
