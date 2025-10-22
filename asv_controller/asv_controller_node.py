@@ -80,9 +80,9 @@ class ControllerNode(Node):
 
         # Parameters for LOS
         self.params = {
-            "los": 5.0,   # Lookahead distance for LOS (m)
+            "los": 5.0,    # Lookahead distance for LOS (m)
             "U": 1.0,      # Desired speed [m/s]
-            "k": 0.3       # Parameter update gain
+            "k": 0.6       # Parameter update gain
         }  
         # Path state – remains None until a waypoint message is received (or a file is explicitly requested).
         self.path_fcn = None
